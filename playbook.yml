@@ -1,0 +1,380 @@
+---
+- name: Setup Kubernetes Cluster and Configure Network
+  hosts: all
+  
+  tasks:
+    # 1. Adding entries to /etc/hosts on each node
+    - name: Add master and workers to /etc/hosts
+      lineinfile:
+        path: /etc/hosts
+        line: "{{ hostvars[item]['ansible_default_ipv4']['address'] }} {{ item }}"
+        state: present
+      with_items: "{{ groups['all'] }}"
+
+    # 2. Remove microk8s which conflicts with k8s
+    - name: Remove MicroK8s if installed
+      shell: sudo snap remove microk8s || true
+
+    # 3. Installing containerd on all nodes
+    - name: Install dependencies for containerd
+      apt:
+        name:
+          - curl
+          - gnupg2
+          - software-properties-common
+          - apt-transport-https
+          - ca-certificates
+        state: present
+        update_cache: yes
+
+    - name: Add Docker GPG key
+      shell: |
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+      args:
+        creates: /usr/share/keyrings/docker-archive-keyring.gpg
+
+    - name: Add Docker APT repository
+      apt_repository:
+        repo: "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu jammy stable"
+        state: present
+
+    - name: Install containerd
+      apt:
+        name: containerd.io
+        state: present
+        update_cache: yes
+
+    - name: Configure containerd to use systemd as cgroup driver
+      shell: |
+        containerd config default | sudo tee /etc/containerd/config.toml >/dev/null 2>&1
+        sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
+
+    - name: Restart containerd
+      systemd:
+        name: containerd
+        enabled: yes
+        state: restarted
+
+    # 4. Added Kubernetes repository
+    - name: Create directory for apt keyrings
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Add Kubernetes signing key if not already present
+      shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Add Kubernetes APT repository if not already present
+      shell: |
+        echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
+      args:
+        creates: /etc/apt/sources.list.d/kubernetes.list
+
+    - name: Update apt package index after adding Kubernetes repo
+      apt:
+        update_cache: yes
+
+    - name: Install Kubernetes tools (kubeadm, kubelet, kubectl)
+      apt:
+        name:
+          - kubeadm
+          - kubelet
+          - kubectl
+        state: present
+      retries: 3
+      delay: 10
+      until: result is succeeded
+      register: result
+
+    - name: Hold Kubernetes tools versions
+      shell: sudo apt-mark hold kubeadm kubelet kubectl
+
+    # 5. Disabling swap permanently
+    - name: Disable swap temporarily
+      shell: sudo swapoff -a
+
+    - name: Ensure swap is disabled by commenting out any swap entry in /etc/fstab
+      lineinfile:
+        path: /etc/fstab
+        regexp: '(^[^#].*swap.*)'
+        line: '# \1'
+        backrefs: yes
+
+    # 6. Network Configuration for Kubernetes
+    - name: Ensure containerd.conf exists
+      file:
+        path: /etc/modules-load.d/containerd.conf
+        state: touch
+
+    - name: Set network modules for Kubernetes
+      lineinfile:
+        path: /etc/modules-load.d/containerd.conf
+        line: "{{ item }}"
+      with_items:
+        - overlay
+        - br_netfilter
+
+    - name: Load required kernel modules
+      shell: |
+        sudo modprobe overlay
+        sudo modprobe br_netfilter
+
+    - name: Ensure sysctl config directory exists
+      file:
+        path: /etc/sysctl.d
+        state: directory
+        mode: '0755'
+
+    - name: Create Kubernetes sysctl config file
+      copy:
+        dest: /etc/sysctl.d/kubernetes.conf
+        content: |
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.bridge.bridge-nf-call-iptables = 1
+          net.ipv4.ip_forward = 1
+        mode: '0644'
+
+    - name: Apply sysctl settings for Kubernetes networking
+      command: sysctl --system
+
+    # 7. Hostname configuration on master and worker nodes
+    - name: Set hostname based on inventory_hostname
+      hostname:
+        name: "{{ inventory_hostname }}"
+
+    # 8. Init k8s cluster on master
+    - block:
+      - name: Add or modify KUBELET_EXTRA_ARGS in kubelet config
+        lineinfile:
+          path: /etc/default/kubelet
+          regexp: '^KUBELET_EXTRA_ARGS='
+          line: 'KUBELET_EXTRA_ARGS="--cgroup-driver=systemd"'
+          create: yes
+
+      - name: Reload and restart kubelet
+        shell: sudo systemctl daemon-reload && sudo systemctl restart kubelet
+        retries: 3
+        delay: 5
+
+      - name: Remove cni0 interface if it exists
+        command: ip link delete cni0
+        ignore_errors: yes
+
+      - name: Remove flannel.1 interface if it exists
+        command: ip link delete flannel.1
+        ignore_errors: yes
+
+      - name: Initialize Kubernetes cluster
+        shell: sudo kubeadm init --control-plane-endpoint=test-master --upload-certs --pod-network-cidr=10.244.0.0/16 --service-cidr=10.96.0.0/12 --service-dns-domain=cluster.local
+        register: kubeadm_init_output
+
+      - name: Extract kubeadm join command for workers
+        shell: echo "{{ kubeadm_init_output.stdout }}" | tail -n 2
+        register: kubeadm_join_command
+
+      - name: Set kubeadm join command as fact on workers
+        set_fact:
+          kubeadm_join_command_fact: "{{ kubeadm_join_command.stdout }}"
+        delegate_to: "{{ item }}"
+        delegate_facts: true
+        with_items: "{{ groups['workers'] }}"
+
+      - name: Create directory for Kubernetes configuration
+        file:
+          path: "{{ ansible_env.HOME }}/.kube"
+          state: directory
+          mode: '0755'
+
+      - name: Copy Kubernetes admin.conf to kube config
+        copy:
+          src: /etc/kubernetes/admin.conf
+          dest: "{{ ansible_env.HOME }}/.kube/config"
+          remote_src: yes
+          owner: "{{ ansible_user_id }}"
+          group: "{{ ansible_user_id }}"
+          mode: '0644'
+
+      - name: Change ownership of .kube/config
+        file:
+          path: "{{ ansible_env.HOME }}/.kube/config"
+          owner: "{{ ansible_user_id }}"
+          group: "{{ ansible_user_id }}"
+          mode: '0644'
+
+      - name: Untaint master node
+        command: kubectl taint nodes --all node-role.kubernetes.io/control-plane-
+
+      - name: Create subnet.env file for Flannel
+        shell: |
+          sudo mkdir -p /run/flannel
+          sudo tee /run/flannel/subnet.env > /dev/null <<EOF
+          FLANNEL_NETWORK=10.244.0.0/16
+          FLANNEL_SUBNET=10.244.1.0/24
+          FLANNEL_MTU=1450
+          FLANNEL_IPMASQ=true
+          EOF
+
+      # 9. Fannel installation
+      - name: Install Flannel pod network
+        command: kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+        retries: 3
+        delay: 5
+
+      when: inventory_hostname == 'test-master'
+      rescue:
+        - name: Log error in initializing Kubernetes cluster
+          debug:
+            msg: "Error initializing Kubernetes cluster on {{ inventory_hostname }}: {{ ansible_failed_result }}"
+      always:
+        - name: Ensure cleanup after block execution
+          debug:
+            msg: "Completed Kubernetes initialization block on {{ inventory_hostname }}"
+    
+    # 10. Adding workers to the Cluster
+    - block:
+      - name: Restart containerd
+        command: sudo systemctl restart containerd.service
+
+      - name: Join worker node to Kubernetes cluster
+        shell: "{{ kubeadm_join_command_fact }}"
+        when: inventory_hostname != 'test-master'
+          
+      when: inventory_hostname != 'test-master'
+      rescue:
+        - name: Log error in initializing Kubernetes cluster
+          debug:
+            msg: "Error initializing Kubernetes cluster on {{ inventory_hostname }}: {{ ansible_failed_result }}"
+      always:
+        - name: Ensure cleanup after block execution
+          debug:
+            msg: "Completed Kubernetes initialization block on {{ inventory_hostname }}"
+
+    # 11. Verification if the cluster is running
+    - name: Pause before checking node status
+      wait_for:
+        timeout: 60
+
+    - block:
+        - name: Get Kubernetes nodes status
+          command: kubectl get nodes
+          register: kubectl_nodes_status
+          ignore_errors: yes
+
+        - name: Display Kubernetes nodes status
+          debug:
+            msg: "{{ kubectl_nodes_status.stdout }}"
+      when: inventory_hostname == 'test-master'
+      rescue:
+        - name: Log error in initializing Kubernetes cluster
+          debug:
+            msg: "Error initializing Kubernetes cluster on {{ inventory_hostname }}: {{ ansible_failed_result }}"
+      always:
+        - name: Ensure cleanup after block execution
+          debug:
+            msg: "Completed Kubernetes initialization block on {{ inventory_hostname }}"
+
+    # 12. MetalLB installation
+    - block:
+      - name: Install MetalLB using manifests
+        command: kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.8/config/manifests/metallb-native.yaml
+
+      - name: Wait for MetalLB pods to be created
+        command: sleep 60
+
+      - name: Configure MetalLB IP address pool
+        copy:
+          dest: /tmp/metallb-config.yaml
+          content: |
+            apiVersion: metallb.io/v1beta1
+            kind: IPAddressPool
+            metadata:
+              name: default-address-pool
+              namespace: metallb-system
+            spec:
+              addresses:
+              - 10.200.0.100-10.200.0.110
+            ---
+            apiVersion: metallb.io/v1beta1
+            kind: L2Advertisement
+            metadata:
+              name: example
+              namespace: metallb-system
+
+      - name: Apply MetalLB configuration
+        command: kubectl apply -f /tmp/metallb-config.yaml
+      
+
+      # 13. NGINX server implementation
+      - name: Deploy NGINX as a test application
+        command: kubectl create deployment nginx --image=nginx --replicas=2
+
+      - name: Expose NGINX service as LoadBalancer
+        command: kubectl expose deployment nginx --port=80 --type=LoadBalancer
+
+      - name: Wait for NGINX LoadBalancer IP assignment
+        command: sleep 10
+
+      # 14. Checking the status of the NGINX service
+      - name: Get NGINX service status
+        command: kubectl get svc nginx
+        register: nginx_service_status
+
+      - name: Display NGINX service LoadBalancer IP
+        debug:
+          msg: "NGINX LoadBalancer IP: {{ nginx_service_status.stdout }}"
+
+      - name: Describe NGINX service for more details
+        command: kubectl describe svc nginx
+        register: nginx_service_description
+
+      - name: Display NGINX service description
+        debug:
+          msg: "{{ nginx_service_description.stdout }}"
+
+      # 15. Adding an HTML page with the hostname to each NGINX pod
+      - name: Get list of NGINX pods
+        command: kubectl get pods -l app=nginx -o jsonpath='{.items[*].metadata.name}'
+        register: nginx_pods
+        until: nginx_pods is succeeded
+        retries: 3
+        delay: 5
+
+      - name: Configure custom HTML page in each NGINX pod
+        shell: |
+          kubectl exec -i {{ item }} -- /bin/sh -c 'echo "<h1>Host: $(hostname)</h1>" > /usr/share/nginx/html/index.html'
+        loop: "{{ nginx_pods.stdout.split() }}"
+
+      # 16. Checking the accessibility of the modified page
+      - name: Get NGINX LoadBalancer IP
+        command: kubectl get svc nginx -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+        register: nginx_lb_ip
+        until: nginx_lb_ip.stdout != ""
+        retries: 8
+        delay: 5
+
+      - name: Wait for NGINX to serve the custom page
+        shell: |
+          until curl -s http://{{ nginx_lb_ip.stdout }} | grep "Host:"; do
+            echo "Waiting for NGINX custom page..."
+            sleep 5
+          done
+        register: nginx_curl_output
+
+      - name: Display NGINX LoadBalancer response
+        debug:
+          msg: "NGINX is serving custom HTML page: {{ nginx_curl_output.stdout }}"
+
+      when: inventory_hostname == 'test-master'
+      rescue:
+        - name: Log error in initializing Kubernetes cluster
+          debug:
+            msg: "Error initializing Kubernetes cluster on {{ inventory_hostname }}: {{ ansible_failed_result }}"
+      always:
+        - name: Ensure cleanup after block execution
+          debug:
+            msg: "Completed Kubernetes initialization block on {{ inventory_hostname }}"
+  become: yes
